@@ -2,7 +2,9 @@
  * dub-drama.js
  * Input: a full drama episode (3-5 min), already the right length — nothing is trimmed.
  * Output: final_output.mp4
- *   - full episode, multi-character Burmese AI dub (2+ distinct voices)
+ *   - full episode, multi-character Burmese AI dub (2+ distinct voices, gender-matched)
+ *   - original background music/SFX preserved (original dialogue removed via
+ *     Demucs vocal separation, new Burmese dub mixed on top of the instrumental bed)
  *   - converted to 9:16 vertical (TikTok/Shorts format) with blurred background padding
  *   - NO subtitles, NO watermark removal by default (see WATERMARK_BOX below)
  *
@@ -10,6 +12,10 @@
  *   npm install @google/genai
  *   ffmpeg + ffprobe installed
  *   edge-tts installed (pip install edge-tts) — free, no API key needed
+ *   demucs installed (pip install demucs) — free, no API key needed, but pulls
+ *     in PyTorch so the first install/run takes a few extra minutes in CI. If
+ *     it fails for any reason, the pipeline automatically falls back to
+ *     dub-only audio (no background bed) rather than failing the whole run.
  *
  * Env vars required:
  *   GEMINI_API_KEY
@@ -97,13 +103,24 @@ Rules:
 - Cues must be in chronological order and must not overlap.
 - Identify each distinct speaking character and label them consistently as
   "speaker": "A", "B", "C", etc. (reuse the same letter for the same character
-  throughout the whole episode).
-- For each speaker, note their apparent gender as "gender": "male" or "female"
-  (best guess from voice/appearance) so we can assign a matching AI voice.
+  throughout the whole episode — double check you haven't split one character
+  into two labels or merged two characters into one).
+- For "gender", listen to the actual voice pitch/timbre of that speaker as your
+  PRIMARY signal (not just visual appearance/clothing/hair, which can mislead).
+  Cross-check against how they're addressed by other characters if names/titles
+  are used (e.g. "he/she", "Mr./Mrs.", gendered names) to confirm. Answer
+  "male" or "female" — pick the closer match even if slightly uncertain, don't
+  leave it ambiguous.
 - "burmese" must be natural, spoken, conversational Burmese matching the tone/
   emotion of that line (dramatic, tender, angry, etc. as appropriate) — this is
   a full dialogue dub, not a narrated summary, so translate/adapt each line as
   something that character would actually say.
+- PACING: write each "burmese" line so it can naturally be SPOKEN OUT LOUD within
+  roughly the cue's (end - start) duration at a normal conversational pace.
+  Don't write a long sentence for a 1-second reaction shot, and don't write a
+  clipped fragment for a 6-second monologue — match the line's length to how
+  long that character is actually seen/heard speaking. This matters a lot for
+  keeping the dub in sync with the video.
 - Timestamps in MM:SS format, relative to this video.
 
 Return ONLY valid JSON, no markdown, no explanation, in this exact shape:
@@ -187,6 +204,20 @@ Return ONLY valid JSON, no markdown, no explanation, in this exact shape:
   const dubTrack = path.join(tmpDir, "dub.wav");
   buildAudioTrack(audioClips, videoDuration, dubTrack);
 
+  // ---- 4b. Isolate original background music/SFX (remove the original speech)
+  //          so the dub sits on top of the real soundtrack instead of dead silence.
+  let finalAudioTrack = dubTrack;
+  try {
+    console.log("Separating original vocals from music/SFX with Demucs (this can take a few minutes)...");
+    const backgroundBed = separateBackgroundAudio(INPUT_PATH, tmpDir, videoDuration);
+    finalAudioTrack = path.join(tmpDir, "dub_with_background.wav");
+    mixDubWithBackground(dubTrack, backgroundBed, videoDuration, finalAudioTrack);
+    console.log("Background music/SFX preserved and mixed under the new dub.");
+  } catch (err) {
+    console.warn("Background separation failed, falling back to dub-only audio:", err.message);
+    finalAudioTrack = dubTrack;
+  }
+
   // ---- 5. Final ffmpeg pass: (optional watermark removal) + 9:16 vertical + mux new audio ----
   console.log("Rendering final video (9:16 vertical + multi-voice dub)...");
   const { width: vidW, height: vidH } = getDimensions(INPUT_PATH);
@@ -208,7 +239,7 @@ Return ONLY valid JSON, no markdown, no explanation, in this exact shape:
   ].join(";");
 
   execSync(
-    `ffmpeg -y -i "${INPUT_PATH}" -i "${dubTrack}" ` +
+    `ffmpeg -y -i "${INPUT_PATH}" -i "${finalAudioTrack}" ` +
       `-filter_complex "${filterComplex}" ` +
       `-map "[v]" -map 1:a ` +
       `-c:v libx264 -crf 20 -preset veryfast -c:a aac -shortest "${OUTPUT_PATH}"`,
@@ -263,10 +294,58 @@ function edgeTTS(text, outPath, voice, pitch) {
 
 function fitAudioToSlot(inputPath, rawDuration, slotDuration, outPath) {
   let factor = rawDuration / slotDuration;
-  factor = Math.max(1.0, Math.min(2.0, factor)); // only speed up, never slow down
+  factor = Math.max(1.0, Math.min(3.0, factor)); // only speed up, never slow down; cap at 3x total
+  if (factor > 2.5) {
+    console.warn(
+      `  [timing] Line needed ${factor.toFixed(2)}x speedup to fit its slot — ` +
+      `consider shortening that cue's Burmese text for better sync.`
+    );
+  }
+  // atempo only accepts 0.5-2.0 per instance, so chain two filters for anything above 2x.
+  const atempoChain =
+    factor > 2.0
+      ? `atempo=2.0,atempo=${(factor / 2.0).toFixed(3)}`
+      : `atempo=${factor.toFixed(3)}`;
   execSync(
-    `ffmpeg -y -i "${inputPath}" -filter:a "atempo=${factor.toFixed(3)},volume=0.85" -ar 44100 -ac 2 "${outPath}"`,
+    `ffmpeg -y -i "${inputPath}" -filter:a "${atempoChain},volume=0.85" -ar 44100 -ac 2 "${outPath}"`,
     { stdio: "ignore" }
+  );
+}
+
+// Runs Demucs (free, open-source vocal separation) on the original video's
+// audio and returns the path to a WAV containing everything EXCEPT the
+// original spoken dialogue (music, ambience, sound effects) — this becomes
+// the bed the new Burmese dub sits on top of, instead of dead silence.
+function separateBackgroundAudio(videoPath, tmpDir, videoDuration) {
+  const originalAudio = path.join(tmpDir, "original_audio.wav");
+  execSync(`ffmpeg -y -i "${videoPath}" -vn -acodec pcm_s16le -ar 44100 -ac 2 "${originalAudio}"`, {
+    stdio: "ignore",
+  });
+
+  const demucsOutDir = path.join(tmpDir, "demucs_out");
+  execFileSync(
+    "demucs",
+    ["--two-stems", "vocals", "-n", "htdemucs", "-o", demucsOutDir, originalAudio],
+    { stdio: "inherit" }
+  );
+
+  // Demucs writes to <out>/<model_name>/<input_basename>/no_vocals.wav
+  const baseName = path.basename(originalAudio, path.extname(originalAudio));
+  const noVocalsPath = path.join(demucsOutDir, "htdemucs", baseName, "no_vocals.wav");
+  if (!fs.existsSync(noVocalsPath)) {
+    throw new Error(`Demucs output not found at expected path: ${noVocalsPath}`);
+  }
+  return noVocalsPath;
+}
+
+// Mixes the new dub (full volume) with the isolated background bed (lowered
+// slightly so it doesn't compete with the new voice), trimmed to video length.
+function mixDubWithBackground(dubPath, backgroundPath, totalDuration, outPath) {
+  execSync(
+    `ffmpeg -y -i "${dubPath}" -i "${backgroundPath}" ` +
+      `-filter_complex "[1:a]volume=0.55,atrim=0:${totalDuration}[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=0[aout]" ` +
+      `-map "[aout]" -t ${totalDuration} "${outPath}"`,
+    { stdio: "inherit" }
   );
 }
 
