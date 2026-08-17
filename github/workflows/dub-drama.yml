@@ -1,0 +1,52 @@
+name: Dub Drama Episode
+
+on:
+  workflow_dispatch:
+    inputs:
+      drive_file_id:
+        description: "Google Drive file ID of the drama episode (3-5 min .mp4)"
+        required: true
+
+jobs:
+  dub:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Install gdown
+        run: pip install --break-system-packages -U gdown
+
+      - name: Install edge-tts
+        run: pip install --break-system-packages -U edge-tts
+
+      - name: Download input episode from Google Drive
+        run: gdown "${{ github.event.inputs.drive_file_id }}" -O episode.mp4
+
+      - name: Verify downloaded video
+        run: |
+          ls -lh episode.mp4
+          file episode.mp4
+
+      - name: Dub drama episode (multi-voice, vertical, no subtitles)
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: node dub-drama.js episode.mp4 final_output.mp4
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-video
+          path: final_output.mp4
