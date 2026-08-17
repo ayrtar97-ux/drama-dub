@@ -10,7 +10,7 @@ on:
 jobs:
   dub:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -31,6 +31,9 @@ jobs:
 
       - name: Install edge-tts
         run: pip install --break-system-packages -U edge-tts
+
+      - name: Install demucs (vocal/background separation)
+        run: pip install --break-system-packages -U demucs
 
       - name: Download input episode from Google Drive
         run: gdown "${{ github.event.inputs.drive_file_id }}" -O episode.mp4
