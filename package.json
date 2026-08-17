@@ -1,0 +1,9 @@
+{
+  "name": "drama-dub",
+  "version": "1.0.0",
+  "description": "Multi-character Burmese AI dub for short drama episodes, converted to 9:16 vertical",
+  "main": "dub-drama.js",
+  "dependencies": {
+    "@google/genai": "^1.0.0"
+  }
+}
